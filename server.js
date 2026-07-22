@@ -1,5 +1,6 @@
 "use strict";
 
+const crypto = require("crypto");
 const express = require("express");
 const cookieParser = require("cookie-parser");
 const OpenAI = require("openai").default ?? require("openai");
@@ -14,16 +15,44 @@ app.use(cookieParser());
 const PLAN_PRICE_CENTS = 1999; // $19.99 / month
 
 // ---------------------------------------------------------------------------
-// CSRF protection for cookie-authenticated JSON routes.
-// For cross-origin state-changing requests, browsers send a CORS preflight
-// when a custom header is present. Requiring this header ensures that
-// same-site form submissions (which cannot set custom headers) are rejected.
+// CSRF – double-submit cookie pattern
+//
+// GET  /api/csrf-token  → sets a `csrf` HttpOnly=false cookie and returns the
+//                          token value; clients store it and send it back as
+//                          the X-CSRF-Token header on state-changing requests.
+//
+// requireCsrf middleware → compares the X-CSRF-Token header to the `csrf`
+//                           cookie value; rejects with 403 if they diverge.
 // ---------------------------------------------------------------------------
-function requireJsonCsrfHeader(req, res, next) {
-  const header = req.get("X-Requested-With");
-  if (header !== "XMLHttpRequest") {
+app.get("/api/csrf-token", (_req, res) => {
+  const token = crypto.randomBytes(32).toString("hex");
+  res.cookie("csrf", token, { sameSite: "strict", httpOnly: false });
+  res.json({ csrfToken: token });
+});
+
+function requireCsrf(req, res, next) {
+  const headerToken = req.get("X-CSRF-Token");
+  const cookieToken = req.cookies && req.cookies.csrf;
+
+  if (!headerToken || !cookieToken) {
     return res.status(403).json({ error: "forbidden" });
   }
+
+  // timingSafeEqual requires same-length buffers; pad/normalise via hex to
+  // avoid leaking length information while still rejecting mismatches safely.
+  try {
+    const a = Buffer.from(headerToken, "utf8");
+    const b = Buffer.from(cookieToken, "utf8");
+    const match =
+      a.length === b.length &&
+      crypto.timingSafeEqual(a, b);
+    if (!match) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+  } catch {
+    return res.status(403).json({ error: "forbidden" });
+  }
+
   next();
 }
 
@@ -48,7 +77,7 @@ function requireAuth(req, res, next) {
 // ---------------------------------------------------------------------------
 // POST /api/ai/chat
 // ---------------------------------------------------------------------------
-app.post("/api/ai/chat", requireJsonCsrfHeader, requireAuth, async (req, res) => {
+app.post("/api/ai/chat", requireCsrf, requireAuth, async (req, res) => {
   const { message } = req.body ?? {};
 
   if (!message || typeof message !== "string" || message.trim() === "") {
