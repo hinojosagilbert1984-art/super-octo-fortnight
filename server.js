@@ -2,12 +2,28 @@
 
 const crypto = require("crypto");
 const express = require("express");
-const cookieParser = require("cookie-parser");
+const session = require("express-session");
 const OpenAI = require("openai").default ?? require("openai");
 
 const app = express();
 app.use(express.json());
-app.use(cookieParser());
+
+// ---------------------------------------------------------------------------
+// Session middleware – keeps session data server-side; the client only holds
+// an opaque session ID cookie.  Use a strong, rotating secret in production.
+// ---------------------------------------------------------------------------
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET ?? crypto.randomBytes(32).toString("hex"),
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: "strict",
+      secure: process.env.NODE_ENV === "production",
+    },
+  }),
+);
 
 // ---------------------------------------------------------------------------
 // Subscription plan price stored in cents (Stripe-style), displayed in dollars
@@ -15,37 +31,35 @@ app.use(cookieParser());
 const PLAN_PRICE_CENTS = 1999; // $19.99 / month
 
 // ---------------------------------------------------------------------------
-// CSRF – double-submit cookie pattern
+// CSRF – synchronizer token pattern
 //
-// GET  /api/csrf-token  → sets a `csrf` HttpOnly=false cookie and returns the
-//                          token value; clients store it and send it back as
-//                          the X-CSRF-Token header on state-changing requests.
+// GET  /api/csrf-token  → generates a cryptographically random token, stores
+//                          it in the server-side session, and returns it to
+//                          the client.  The client must send it back via the
+//                          X-CSRF-Token header on every state-changing request.
 //
-// requireCsrf middleware → compares the X-CSRF-Token header to the `csrf`
-//                           cookie value; rejects with 403 if they diverge.
+// requireCsrf middleware → compares X-CSRF-Token header against the session-
+//                           stored token using timingSafeEqual.
 // ---------------------------------------------------------------------------
-app.get("/api/csrf-token", (_req, res) => {
+app.get("/api/csrf-token", (req, res) => {
   const token = crypto.randomBytes(32).toString("hex");
-  res.cookie("csrf", token, { sameSite: "strict", httpOnly: false });
+  req.session.csrfToken = token;
   res.json({ csrfToken: token });
 });
 
 function requireCsrf(req, res, next) {
   const headerToken = req.get("X-CSRF-Token");
-  const cookieToken = req.cookies && req.cookies.csrf;
+  const sessionToken = req.session && req.session.csrfToken;
 
-  if (!headerToken || !cookieToken) {
+  if (!headerToken || !sessionToken) {
     return res.status(403).json({ error: "forbidden" });
   }
 
-  // timingSafeEqual requires same-length buffers; pad/normalise via hex to
-  // avoid leaking length information while still rejecting mismatches safely.
   try {
     const a = Buffer.from(headerToken, "utf8");
-    const b = Buffer.from(cookieToken, "utf8");
+    const b = Buffer.from(sessionToken, "utf8");
     const match =
-      a.length === b.length &&
-      crypto.timingSafeEqual(a, b);
+      a.length === b.length && crypto.timingSafeEqual(a, b);
     if (!match) {
       return res.status(403).json({ error: "forbidden" });
     }
@@ -57,21 +71,31 @@ function requireCsrf(req, res, next) {
 }
 
 // ---------------------------------------------------------------------------
-// Auth middleware – requires a valid session cookie
+// Auth middleware – requires a valid user ID in the session
 // ---------------------------------------------------------------------------
-
-// Regex for an opaque session token: 8–128 URL-safe characters
-const SESSION_TOKEN_RE = /^[A-Za-z0-9._~-]{8,128}$/;
-
 function requireAuth(req, res, next) {
-  const sessionToken = req.cookies && req.cookies.session;
-  if (!sessionToken || !SESSION_TOKEN_RE.test(sessionToken)) {
+  const userId = req.session && req.session.userId;
+  if (!userId) {
     return res.status(401).json({ error: "unauthorized" });
   }
-  // In a real app, validate the session token against a DB / JWT secret
-  // and resolve a full user object before attaching it here.
-  req.user = { id: sessionToken };
+  req.user = { id: userId };
   next();
+}
+
+// ---------------------------------------------------------------------------
+// Test-only login shim – seeds userId into the session so integration tests
+// can simulate an authenticated user without a real auth flow.
+// Must only be registered in non-production environments.
+// ---------------------------------------------------------------------------
+if (process.env.NODE_ENV !== "production") {
+  app.post("/api/test-login", (req, res) => {
+    const { userId } = req.body ?? {};
+    if (!userId) {
+      return res.status(400).json({ error: "userId required" });
+    }
+    req.session.userId = userId;
+    res.json({ ok: true });
+  });
 }
 
 // ---------------------------------------------------------------------------
